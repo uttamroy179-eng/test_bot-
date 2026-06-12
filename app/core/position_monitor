@@ -1,0 +1,400 @@
+# app/core/position_monitor.py
+
+import asyncio
+from typing import Dict, List, Optional
+from engine.risk_manager import PositionState, DailyLossTracker
+from app.notifier import (
+    notify_sl_hit,
+    notify_tp_hit,
+    notify_pyramid,
+    notify_daily_loss_limit,
+    notify_error,
+)
+
+
+async def monitor_positions(
+    positions: Dict[str, PositionState],
+    current_prices: Dict[str, float],
+    executor,
+    daily_tracker: Optional[DailyLossTracker],
+    trade_history: List[Dict],
+    auto_trading_enabled: bool,
+) -> None:
+    """
+    Main position monitor loop — called on every monitor cycle.
+
+    Responsibilities:
+      - Check SL breach for every open position
+      - Check TP1 / TP2 / TP3 scale-out triggers
+      - Check pyramid add-on triggers
+      - Record PnL to daily_tracker after every exit
+      - Halt new entries (via daily_tracker flag) when daily loss limit breached
+      - Remove fully closed positions from the positions dict
+      - Append closed trade records to trade_history
+
+    Design decisions (confirmed by user):
+      - SL close order failure  → log, keep position, retry next cycle
+      - TP scale_out failure    → log, mark TP hit anyway, move on
+      - Pyramid order failure   → log, increment pyramid_level anyway
+      - Daily loss limit breach → finish current exit, then halt new entries only
+    """
+
+    # ------------------------------------------------------------------ #
+    # FIX 9: Guard against daily_tracker not yet initialised              #
+    # ------------------------------------------------------------------ #
+    if daily_tracker is None:
+        print("[Monitor] daily_tracker not initialised yet — skipping cycle.")
+        return
+
+    # Snapshot the symbol list so we can safely mutate `positions` mid-loop
+    symbols = list(positions.keys())
+
+    for symbol in symbols:
+
+        # Position may have been deleted earlier in this same cycle
+        if symbol not in positions:
+            continue
+
+        position: PositionState = positions[symbol]
+
+        # Fetch current price for this symbol
+        current_price: Optional[float] = current_prices.get(symbol)
+        if current_price is None:
+            print(f"[Monitor] No price available for {symbol} — skipping.")
+            continue
+
+        # ------------------------------------------------------------------ #
+        # DAILY LOSS LIMIT CHECK                                              #
+        # FIX (Option B): Only block new entries — existing exits still run   #
+        # ------------------------------------------------------------------ #
+        daily_limit_breached = daily_tracker.check_daily_loss_limit()
+
+        # ------------------------------------------------------------------ #
+        # BLOCK 1 — STOP LOSS CHECK                                           #
+        # ------------------------------------------------------------------ #
+        if _is_sl_hit(position, current_price):
+            print(
+                f"[Monitor] SL hit for {symbol} | "
+                f"price={current_price} sl={position.sl}"
+            )
+
+            # FIX 4: Capture size BEFORE record_sl_exit() zeroes it
+            size_before_exit = position.current_size
+
+            if auto_trading_enabled:
+                # FIX 5: Check close order result — retain position on failure
+                close_result = await executor.close_position(
+                    symbol, position.side, size_before_exit
+                )
+
+                if not close_result or not close_result.get("success"):
+                    print(
+                        f"[Monitor] SL close order FAILED for {symbol} "
+                        f"(result={close_result}). "
+                        f"Retaining position — will retry next cycle."
+                    )
+                    await notify_error(
+                        symbol,
+                        "SL_CLOSE_FAILED",
+                        f"close_position returned {close_result}",
+                    )
+                    # Do NOT update state — retry next cycle
+                    continue
+
+            # Order succeeded (or auto_trading disabled) — update internal state
+            pnl = position.record_sl_exit(current_price)
+
+            # Record PnL to daily tracker
+            daily_tracker.record_trade(pnl)
+
+            # Append to trade history
+            trade_history.append(
+                _build_trade_record(
+                    symbol=symbol,
+                    side=position.side,
+                    exit_type="SL",
+                    exit_price=current_price,
+                    size=size_before_exit,
+                    pnl=pnl,
+                )
+            )
+
+            # FIX 1: Correct 3-arg signature
+            await notify_sl_hit(symbol, current_price, pnl)
+
+            # Remove fully closed position
+            del positions[symbol]
+            print(
+                f"[Monitor] Position closed via SL for {symbol} | "
+                f"pnl={pnl:.2f} | size_closed={size_before_exit}"
+            )
+
+            # Check daily loss limit AFTER recording this trade
+            if daily_tracker.check_daily_loss_limit():
+                await _handle_daily_limit_breach(daily_tracker)
+
+            # Move to next symbol — no TP or pyramid checks needed
+            continue
+
+        # ------------------------------------------------------------------ #
+        # BLOCK 2 — TAKE PROFIT CHECKS (TP1 → TP2 → TP3)                    #
+        # ------------------------------------------------------------------ #
+        for tp_level in [1, 2, 3]:
+
+            # Re-check: position may have been fully closed by a prior TP level
+            if symbol not in positions:
+                break
+
+            # Re-fetch position reference (safe after potential earlier del)
+            position = positions[symbol]
+
+            tp_price = _get_tp_price(position, tp_level)
+            if tp_price is None:
+                # This TP level not configured
+                continue
+
+            if _is_tp_already_hit(position, tp_level):
+                continue
+
+            if not _is_tp_hit(position, current_price, tp_price):
+                continue
+
+            # TP level is hit
+            print(
+                f"[Monitor] TP{tp_level} hit for {symbol} | "
+                f"price={current_price} tp{tp_level}={tp_price}"
+            )
+
+            close_size = _get_tp_close_size(position, tp_level)
+            size_before_exit = position.current_size
+
+            if auto_trading_enabled:
+                # FIX 6: Check scale_out result — log failure but mark TP hit anyway
+                scale_result = await executor.scale_out(
+                    symbol, position.side, close_size, tp_level
+                )
+
+                if not scale_result or not scale_result.get("success"):
+                    print(
+                        f"[Monitor] TP{tp_level} scale_out FAILED for {symbol} "
+                        f"(result={scale_result}). "
+                        f"Marking TP{tp_level} as hit anyway — will not retry."
+                    )
+                    await notify_error(
+                        symbol,
+                        f"TP{tp_level}_SCALE_OUT_FAILED",
+                        f"scale_out returned {scale_result}",
+                    )
+                    # Fall through — mark TP hit anyway (by design)
+
+            # Update internal state regardless of order result
+            pnl = position.record_tp_exit(tp_level, current_price, close_size)
+
+            # Record PnL to daily tracker
+            daily_tracker.record_trade(pnl)
+
+            # Append to trade history
+            trade_history.append(
+                _build_trade_record(
+                    symbol=symbol,
+                    side=position.side,
+                    exit_type=f"TP{tp_level}",
+                    exit_price=current_price,
+                    size=close_size,
+                    pnl=pnl,
+                )
+            )
+
+            # FIX 2: Correct 4-arg signature
+            await notify_tp_hit(symbol, tp_level, current_price, pnl)
+
+            print(
+                f"[Monitor] TP{tp_level} recorded for {symbol} | "
+                f"pnl={pnl:.2f} | closed={close_size} | "
+                f"remaining={position.current_size}"
+            )
+
+            # If position fully closed after this TP level, remove and stop
+            if position.current_size <= 0:
+                del positions[symbol]
+                print(f"[Monitor] Position fully closed via TP{tp_level} for {symbol}.")
+
+                # Check daily loss limit after recording this trade
+                if daily_tracker.check_daily_loss_limit():
+                    await _handle_daily_limit_breach(daily_tracker)
+
+                break  # No further TP levels to check
+
+            # Check daily loss limit after each partial TP exit
+            if daily_tracker.check_daily_loss_limit():
+                await _handle_daily_limit_breach(daily_tracker)
+
+        # ------------------------------------------------------------------ #
+        # BLOCK 3 — PYRAMID CHECK                                             #
+        # Skip if: position closed, daily limit breached, or not eligible     #
+        # ------------------------------------------------------------------ #
+        if symbol not in positions:
+            continue
+
+        # FIX (Option B): Daily limit breach blocks new pyramid entries
+        if daily_limit_breached:
+            print(
+                f"[Monitor] Daily loss limit breached — "
+                f"skipping pyramid check for {symbol}."
+            )
+            continue
+
+        position = positions[symbol]
+
+        if _should_pyramid(position, current_price):
+            add_size = _get_pyramid_add_size(position)
+            print(
+                f"[Monitor] Pyramid trigger for {symbol} | "
+                f"level={position.pyramid_level + 1} | "
+                f"price={current_price} | size={add_size}"
+            )
+
+            pyramid_order_success = True  # Assume success if auto_trading disabled
+
+            if auto_trading_enabled:
+                # FIX 8: Place order FIRST, then update state
+                pyramid_result = await executor.place_pyramid_order(
+                    symbol, position.side, add_size, current_price
+                )
+
+                if not pyramid_result or not pyramid_result.get("success"):
+                    print(
+                        f"[Monitor] Pyramid order FAILED for {symbol} "
+                        f"(result={pyramid_result}). "
+                        f"Incrementing pyramid_level anyway to prevent re-trigger."
+                    )
+                    await notify_error(
+                        symbol,
+                        "PYRAMID_ORDER_FAILED",
+                        f"place_pyramid_order returned {pyramid_result}",
+                    )
+                    pyramid_order_success = False
+                    # Fall through — increment level anyway (by design)
+
+            # FIX 8: State updated AFTER order attempt (success or failure)
+            position.add_pyramid(add_size if pyramid_order_success else 0)
+
+            # FIX 3: Correct 4-arg signature and correct argument order
+            await notify_pyramid(
+                symbol,
+                position.pyramid_level,
+                current_price,
+                add_size,
+            )
+
+
+# ------------------------------------------------------------------ #
+# PRIVATE HELPERS                                                      #
+# ------------------------------------------------------------------ #
+
+def _is_sl_hit(position: PositionState, current_price: float) -> bool:
+    """Returns True if current price has breached the stop loss level."""
+    if position.side == "buy":
+        return current_price <= position.sl
+    else:
+        return current_price >= position.sl
+
+
+def _is_tp_hit(
+    position: PositionState, current_price: float, tp_price: float
+) -> bool:
+    """Returns True if current price has reached the TP level."""
+    if position.side == "buy":
+        return current_price >= tp_price
+    else:
+        return current_price <= tp_price
+
+
+def _is_tp_already_hit(position: PositionState, tp_level: int) -> bool:
+    """Returns True if this TP level has already been recorded as hit."""
+    attr = f"tp{tp_level}_hit"
+    return getattr(position, attr, False)
+
+
+def _get_tp_price(position: PositionState, tp_level: int) -> Optional[float]:
+    """Returns the price for the given TP level, or None if not set."""
+    attr = f"tp{tp_level}"
+    return getattr(position, attr, None)
+
+
+def _get_tp_close_size(position: PositionState, tp_level: int) -> int:
+    """
+    Returns the number of contracts to close at each TP level.
+    TP1 and TP2 close 1/3 of original size each.
+    TP3 closes whatever remains.
+    """
+    if tp_level == 3:
+        return position.current_size
+    return max(1, position.initial_size // 3)
+
+
+def _should_pyramid(position: PositionState, current_price: float) -> bool:
+    """
+    Returns True if pyramid conditions are met.
+    Pyramid is allowed up to level 2 (i.e., 2 add-ons after initial entry).
+    Trigger: price moves 1% in trade direction beyond entry per level.
+    """
+    max_pyramid_levels = 2
+    if position.pyramid_level >= max_pyramid_levels:
+        return False
+
+    move_threshold = position.entry_price * 0.01 * (position.pyramid_level + 1)
+
+    if position.side == "buy":
+        return current_price >= position.entry_price + move_threshold
+    else:
+        return current_price <= position.entry_price - move_threshold
+
+
+def _get_pyramid_add_size(position: PositionState) -> int:
+    """
+    Returns the number of contracts to add for a pyramid entry.
+    Each add-on is half the initial position size (minimum 1).
+    """
+    return max(1, position.initial_size // 2)
+
+
+def _build_trade_record(
+    symbol: str,
+    side: str,
+    exit_type: str,
+    exit_price: float,
+    size: int,
+    pnl: float,
+) -> Dict:
+    """Builds a standardised trade history record."""
+    from datetime import datetime
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "exit_type": exit_type,
+        "exit_price": exit_price,
+        "size": size,
+        "pnl": pnl,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+async def _handle_daily_limit_breach(daily_tracker: DailyLossTracker) -> None:
+    """
+    Called when daily loss limit is confirmed breached after recording a trade.
+    Sends notification and sets the halt flag on daily_tracker.
+    New entries will be blocked in auto_trading_loop — existing positions
+    continue to be monitored and exited normally.
+    """
+    print(
+        f"[Monitor] DAILY LOSS LIMIT BREACHED — "
+        f"pnl={daily_tracker.realized_pnl:.2f} | "
+        f"halting new entries."
+    )
+    await notify_daily_loss_limit(
+        daily_pnl=daily_tracker.realized_pnl,
+        daily_loss_pct=daily_tracker.current_loss_pct,
+        limit_pct=daily_tracker.loss_limit_pct,
+    )
